@@ -15,7 +15,6 @@
   html, body { margin: 0; padding: 0; background: #f4f7f9; }
   #root { min-height: 100vh; }
   input, button, select, textarea { font-family: Arial, Helvetica, sans-serif; }
-  /* éviter le zoom iOS sur focus input */
   input, select, textarea { font-size: 16px !important; }
   @media print { body { background: #fff; } }
 </style>
@@ -215,20 +214,54 @@ const nouvelImmeuble = () => ({
   gestionnaire: { societe: "", contact: "", tel: "", email: "" },
   principal: { numero: "", emplacement: "", photoId: null },
   seuilReseau: SEUIL_RESEAU_DEFAUT,
-  releveInitiaux: [], // {date, valeur}
-  visites: [],        // {id, date, principal:{valeur, photoId}, divisionnaires:[{id, designation, numero, emplacement, valeur, photoId}]}
+  etatsInitiaux: [], // états initiaux complets : {id, date, principalValeur, divisionnaires:[{id,designation,numero,valeur}]}
+  visites: [],        // {id, date, principalValeur, principalPhotoId, divisionnaires:[{id, designation, numero, emplacement, valeur, photoId}]}
   creeLe: today(),
 });
+
+// Crée un état initial en reprenant la liste des divisionnaires déjà connus (autre état ou 1re visite)
+const nouvelEtatInitial = (imm) => {
+  const modele = imm.etatsInitiaux[0]?.divisionnaires || imm.visites[0]?.divisionnaires || [];
+  return {
+    id: uid(),
+    date: today(),
+    principalValeur: "",
+    divisionnaires: modele.map((d) => ({
+      id: uid(), designation: d.designation, numero: d.numero, valeur: "",
+    })),
+  };
+};
 
 const nouvelleVisite = (imm) => ({
   id: uid(),
   date: today(),
   principalValeur: "",
   principalPhotoId: null,
-  divisionnaires: (imm.visites[0]?.divisionnaires || []).map((d) => ({
-    id: uid(), designation: d.designation, numero: d.numero, emplacement: d.emplacement, valeur: "", photoId: null,
+  divisionnaires: (imm.visites[0]?.divisionnaires || imm.etatsInitiaux[0]?.divisionnaires || []).map((d) => ({
+    id: uid(), designation: d.designation, numero: d.numero, emplacement: d.emplacement || "", valeur: "", photoId: null,
   })),
 });
+
+// Migration rétrocompatible : ancien format releveInitiaux [{date,valeur}] -> etatsInitiaux
+function migrerImmeuble(imm) {
+  if (!imm.etatsInitiaux) {
+    imm.etatsInitiaux = (imm.releveInitiaux || []).map((r) => ({
+      id: uid(), date: r.date || today(), principalValeur: r.valeur || "", divisionnaires: [],
+    }));
+  }
+  delete imm.releveInitiaux;
+  return imm;
+}
+
+// Séquence complète pour les calculs : états initiaux (triés) PUIS visites (triées), le tout en ordre chronologique
+function sequenceReleves(imm) {
+  const inits = [...(imm.etatsInitiaux || [])].sort((a, b) => (a.date || "").localeCompare(b.date || ""))
+    .map((e) => ({ ...e, _type: "initial", principalPhotoId: null,
+      divisionnaires: e.divisionnaires.map((d) => ({ ...d, emplacement: d.emplacement || "", photoId: null })) }));
+  const vis = [...(imm.visites || [])].sort((a, b) => (a.date || "").localeCompare(b.date || ""))
+    .map((v) => ({ ...v, _type: "visite" }));
+  return [...inits, ...vis];
+}
 
 // ------------------------------------------------------------------
 // Calculs d'écart
@@ -269,11 +302,12 @@ function analyseVisite(imm, visite, precedente) {
   };
 }
 
-// Variation appartement sur 2 intervalles (visite n-1 -> n vs n-2 -> n-1)
-function variationsAppart(imm, visiteIndex) {
-  const v = imm.visites[visiteIndex];
-  const v1 = imm.visites[visiteIndex - 1];
-  const v2 = imm.visites[visiteIndex - 2];
+// Variation appartement sur 2 intervalles, calculée sur la séquence complète
+// (états initiaux + visites). seq = sequenceReleves(imm), idx = position dans seq.
+function variationsAppartSeq(seq, idx) {
+  const v = seq[idx];
+  const v1 = seq[idx - 1];
+  const v2 = seq[idx - 2];
   return v.divisionnaires.map((d) => {
     const key = (x) => x.designation === d.designation && x.numero === d.numero;
     const cur = parseFloat(d.valeur);
@@ -290,6 +324,14 @@ function variationsAppart(imm, visiteIndex) {
     }
     return { designation: d.designation, numero: d.numero, consoActuelle, consoPrec, variation, alerte };
   });
+}
+
+// Variation pour une visite donnée (par son id) en s'appuyant sur la séquence complète
+function variationsPourVisite(imm, visiteId) {
+  const seq = sequenceReleves(imm);
+  const idx = seq.findIndex((s) => s.id === visiteId);
+  if (idx < 0) return [];
+  return variationsAppartSeq(seq, idx);
 }
 
 // ------------------------------------------------------------------
@@ -483,23 +525,38 @@ function FicheImmeuble({ imm, onChange }) {
     onChange(copy);
   };
 
-  const addInitial = () => {
-    if (imm.releveInitiaux.length >= 2) return;
-    onChange({ ...imm, releveInitiaux: [...imm.releveInitiaux, { date: today(), valeur: "" }] });
-  };
-  const setInitial = (i, k, v) => {
-    const arr = imm.releveInitiaux.map((r, idx) => idx === i ? { ...r, [k]: v } : r);
-    onChange({ ...imm, releveInitiaux: arr });
-  };
-  const delInitial = (i) => onChange({ ...imm, releveInitiaux: imm.releveInitiaux.filter((_, idx) => idx !== i) });
+  const etats = imm.etatsInitiaux || [];
 
-  // moyenne base initiale
-  let baseMoyenne = null;
-  if (imm.releveInitiaux.length === 2) {
-    const a = parseFloat(imm.releveInitiaux[0].valeur), b = parseFloat(imm.releveInitiaux[1].valeur);
-    if (!isNaN(a) && !isNaN(b)) baseMoyenne = Math.abs(b - a);
-  }
+  const addEtat = () => {
+    if (etats.length >= 2) return;
+    onChange({ ...imm, etatsInitiaux: [...etats, nouvelEtatInitial(imm)] });
+  };
+  const majEtat = (eid, patch) => {
+    onChange({ ...imm, etatsInitiaux: etats.map((e) => e.id === eid ? { ...e, ...patch } : e) });
+  };
+  const delEtat = (eid) => onChange({ ...imm, etatsInitiaux: etats.filter((e) => e.id !== eid) });
 
+  const addDivEtat = (eid) => {
+    const e = etats.find((x) => x.id === eid);
+    majEtat(eid, { divisionnaires: [...e.divisionnaires, { id: uid(), designation: "", numero: "", valeur: "" }] });
+  };
+  const setDivEtat = (eid, did, k, val) => {
+    const e = etats.find((x) => x.id === eid);
+    majEtat(eid, { divisionnaires: e.divisionnaires.map((d) => d.id === did ? { ...d, [k]: val } : d) });
+  };
+  const delDivEtat = (eid, did) => {
+    const e = etats.find((x) => x.id === eid);
+    majEtat(eid, { divisionnaires: e.divisionnaires.filter((d) => d.id !== did) });
+  };
+
+  // Écart réseau d'un état initial (principal - somme divisionnaires)
+  const ecartEtat = (e) => {
+    const p = parseFloat(e.principalValeur);
+    const divs = e.divisionnaires.map((d) => parseFloat(d.valeur)).filter((x) => !isNaN(x));
+    if (isNaN(p) || divs.length === 0 || divs.length !== e.divisionnaires.length) return null;
+    const somme = divs.reduce((s, x) => s + x, 0);
+    return { ecart: p - somme, pct: p > 0 ? (p - somme) / p : null, somme, principal: p };
+  };
   return (
     <div>
       <div style={S.carte}>
@@ -541,22 +598,59 @@ function FicheImmeuble({ imm, onChange }) {
 
       <div style={S.carte}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <h3 style={{ margin: 0, color: C.bleu }}>Relevés initiaux (base)</h3>
-          {imm.releveInitiaux.length < 2 && (
-            <button onClick={addInitial} style={{ ...S.btn, background: C.fond, color: C.bleu, border: `1px solid ${C.cyan}` }}>+ Ajouter un relevé</button>
+          <h3 style={{ margin: 0, color: C.bleu }}>États initiaux (anciens relevés)</h3>
+          {etats.length < 2 && (
+            <button onClick={addEtat} style={{ ...S.btn, background: C.fond, color: C.bleu, border: `1px solid ${C.cyan}` }}>+ Ajouter un état</button>
           )}
         </div>
-        <p style={{ color: C.gris, fontSize: 13, marginTop: 6 }}>Saisissez 1 ou 2 anciens relevés du compteur principal pour établir une base de comparaison.</p>
-        {imm.releveInitiaux.map((r, i) => (
-          <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-end", marginTop: 8 }}>
-            <div style={{ flex: 1 }}><Champ label="Date" type="date" value={r.date} onChange={(v) => setInitial(i, "date", v)} /></div>
-            <div style={{ flex: 1 }}><Champ label="Index (m³)" type="number" value={r.valeur} onChange={(v) => setInitial(i, "valeur", v)} placeholder="1250" /></div>
-            <button onClick={() => delInitial(i)} style={{ ...S.btn, background: C.rougeFond, color: C.rouge }}>×</button>
+        <p style={{ color: C.gris, fontSize: 13, marginTop: 6 }}>
+          Facultatif. Saisissez 1 ou 2 anciens relevés (principal <b>et</b> divisionnaires) pour connaître l'écart réseau déjà présent avant votre suivi. Si vous ne mettez rien, votre 1re visite servira de référence.
+        </p>
+
+        {etats.length === 0 && (
+          <div style={{ background: C.fond, borderRadius: 8, padding: 12, color: C.gris, fontSize: 13, marginTop: 8 }}>
+            Aucun état initial — la première campagne de visite servira de point de référence.
           </div>
-        ))}
-        {baseMoyenne !== null && (
-          <div style={{ marginTop: 12 }}><Badge type="ok">Base : {nf(baseMoyenne)} m³ consommés entre les 2 relevés</Badge></div>
         )}
+
+        {etats.map((e) => {
+          const ec = ecartEtat(e);
+          return (
+            <div key={e.id} style={{ border: `1px solid ${C.bord}`, borderRadius: 10, padding: 14, marginTop: 12 }}>
+              <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+                <div style={{ width: 150 }}><Champ label="Date du relevé" type="date" value={e.date} onChange={(v) => majEtat(e.id, { date: v })} /></div>
+                <div style={{ width: 160 }}><Champ label="Index principal (m³)" type="number" value={e.principalValeur} onChange={(v) => majEtat(e.id, { principalValeur: v })} placeholder="1250" /></div>
+                <button onClick={() => delEtat(e.id)} style={{ ...S.btn, background: C.rougeFond, color: C.rouge }}>Supprimer l'état</button>
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "14px 0 8px" }}>
+                <strong style={{ color: C.bleu, fontSize: 14 }}>Divisionnaires (anciens index)</strong>
+                <button onClick={() => addDivEtat(e.id)} style={{ ...S.btn, background: C.fond, color: C.bleu, border: `1px solid ${C.cyan}`, padding: "7px 12px" }}>+ Compteur</button>
+              </div>
+
+              {e.divisionnaires.length === 0 && (
+                <div style={{ color: C.gris, fontSize: 12, paddingBottom: 6 }}>Ajoutez les compteurs divisionnaires pour calculer l'écart réseau initial.</div>
+              )}
+
+              {e.divisionnaires.map((d) => (
+                <div key={d.id} style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: 8, background: C.fond, padding: 10, borderRadius: 8 }}>
+                  <div style={{ flex: 1, minWidth: 110 }}><Champ label="Appart/Lot" value={d.designation} onChange={(v) => setDivEtat(e.id, d.id, "designation", v)} placeholder="Appt A3" /></div>
+                  <div style={{ width: 120 }}><Champ label="N° compteur" value={d.numero} onChange={(v) => setDivEtat(e.id, d.id, "numero", v)} placeholder="DIV-A3" /></div>
+                  <div style={{ width: 110 }}><Champ label="Index (m³)" type="number" value={d.valeur} onChange={(v) => setDivEtat(e.id, d.id, "valeur", v)} placeholder="120" /></div>
+                  <button onClick={() => delDivEtat(e.id, d.id)} style={{ ...S.btn, background: C.rougeFond, color: C.rouge }}>×</button>
+                </div>
+              ))}
+
+              {ec && (
+                <div style={{ marginTop: 10 }}>
+                  <Badge type={Math.abs(ec.pct ?? 0) > (imm.seuilReseau ?? SEUIL_RESEAU_DEFAUT) ? "alerte" : "ok"}>
+                    Écart réseau initial : {nf(ec.ecart)} m³ ({pf(ec.pct)})
+                  </Badge>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       <div style={S.carte}>
@@ -620,9 +714,12 @@ function Campagnes({ imm, onChange, onRapport }) {
       )}
 
       {imm.visites.map((v, idx) => {
-        const precedente = imm.visites[idx + 1]; // visites triées desc
+        // précédente chronologique via la séquence complète (peut être un état initial pour la 1re visite)
+        const seq = sequenceReleves(imm);
+        const posSeq = seq.findIndex((s) => s.id === v.id);
+        const precedente = posSeq > 0 ? seq[posSeq - 1] : undefined;
         const a = analyseVisite(imm, v, precedente);
-        const vars = variationsAppart(imm, idx);
+        const vars = variationsAppartSeq(seq, posSeq);
         const nbAlertesAppart = vars.filter((x) => x.alerte).length;
         const estOuverte = ouverte === v.id;
         return (
@@ -742,38 +839,43 @@ async function exportExcel(imm) {
   ];
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(infos), "Infos");
 
-  // Feuille HISTORIQUE — chaque visite empilée
-  const hist = [["Date visite", "Type", "Appartement/Lot", "N° compteur", "Emplacement", "Index (m³)", "Photo"]];
-  const visitesAsc = [...imm.visites].sort((a, b) => a.date.localeCompare(b.date));
-  visitesAsc.forEach((v) => {
-    hist.push([v.date, "PRINCIPAL", "—", imm.principal.numero, imm.principal.emplacement, parseFloat(v.principalValeur) || "", photoName(imm, v, "principal")]);
+  // Séquence complète : états initiaux puis visites, en ordre chronologique
+  const seq = sequenceReleves(imm);
+  const libDate = (s) => s._type === "initial" ? `${s.date} (état initial)` : s.date;
+
+  // Feuille HISTORIQUE — chaque relevé empilé
+  const hist = [["Date", "Nature", "Type", "Appartement/Lot", "N° compteur", "Emplacement", "Index (m³)", "Photo"]];
+  seq.forEach((v) => {
+    const nature = v._type === "initial" ? "État initial" : "Visite";
+    hist.push([v.date, nature, "PRINCIPAL", "—", imm.principal.numero, imm.principal.emplacement, parseFloat(v.principalValeur) || "", v._type === "initial" ? "" : photoName(imm, v, "principal")]);
     v.divisionnaires.forEach((d) => {
-      hist.push([v.date, "Divisionnaire", d.designation, d.numero, d.emplacement, parseFloat(d.valeur) || "", photoName(imm, v, d)]);
+      hist.push([v.date, nature, "Divisionnaire", d.designation, d.numero, d.emplacement || "", parseFloat(d.valeur) || "", v._type === "initial" ? "" : photoName(imm, v, d)]);
     });
     hist.push([]);
   });
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(hist), "Historique");
 
-  // Feuille SYNTHÈSE — écart réseau par visite
-  const syn = [["Date visite", "Index principal", "Somme divisionnaires", "Écart réseau (m³)", "Écart %", "Relevés complets", "Alerte réseau"]];
-  visitesAsc.forEach((v, i) => {
-    const prec = visitesAsc[i - 1];
+  // Feuille SYNTHÈSE — écart réseau par relevé (états initiaux inclus)
+  const syn = [["Date", "Nature", "Index principal", "Somme divisionnaires", "Écart réseau (m³)", "Écart %", "Relevés complets", "Alerte réseau"]];
+  seq.forEach((v, i) => {
+    const prec = seq[i - 1];
     const a = analyseVisite(imm, v, prec);
     syn.push([
-      v.date, a.principal || "", a.complet ? a.sommeDiv : "", a.complet ? a.ecartReseau : "",
+      v.date, v._type === "initial" ? "État initial" : "Visite",
+      a.principal || "", a.complet ? a.sommeDiv : "", a.complet ? a.ecartReseau : "",
       a.complet && a.ecartReseauPct !== null ? Math.round(a.ecartReseauPct * 1000) / 10 + " %" : "",
       `${a.complets}/${a.total}`, a.alerteReseau ? "OUI" : "",
     ]);
   });
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(syn), "Synthèse réseau");
 
-  // Feuille SYNTHÈSE APPART — variation par appartement, une colonne par visite
+  // Feuille SYNTHÈSE APPART — index et conso par appartement, une colonne par relevé
   const appartKeys = {};
-  imm.visites.forEach((v) => v.divisionnaires.forEach((d) => { appartKeys[`${d.designation}|${d.numero}`] = { designation: d.designation, numero: d.numero }; }));
-  const dates = visitesAsc.map((v) => v.date);
-  const synA = [["Appartement/Lot", "N° compteur", ...dates.map((d) => `Index ${d}`), ...dates.slice(1).map((d) => `Conso ${d}`)]];
+  seq.forEach((v) => v.divisionnaires.forEach((d) => { appartKeys[`${d.designation}|${d.numero}`] = { designation: d.designation, numero: d.numero }; }));
+  const cols = seq.map(libDate);
+  const synA = [["Appartement/Lot", "N° compteur", ...cols.map((d) => `Index ${d}`), ...cols.slice(1).map((d) => `Conso ${d}`)]];
   Object.values(appartKeys).forEach((ap) => {
-    const indexes = visitesAsc.map((v) => {
+    const indexes = seq.map((v) => {
       const d = v.divisionnaires.find((x) => x.designation === ap.designation && x.numero === ap.numero);
       return d ? (parseFloat(d.valeur) || "") : "";
     });
@@ -831,11 +933,12 @@ async function exportPhotos(imm) {
 // Rapport d'écart (HTML) avec photos
 // ------------------------------------------------------------------
 async function genererRapport(imm, visiteId) {
-  const idx = imm.visites.findIndex((v) => v.id === visiteId);
-  const v = imm.visites[idx];
-  const prec = imm.visites[idx + 1];
+  const v = imm.visites.find((x) => x.id === visiteId);
+  const seq = sequenceReleves(imm);
+  const posSeq = seq.findIndex((s) => s.id === visiteId);
+  const prec = posSeq > 0 ? seq[posSeq - 1] : undefined;
   const a = analyseVisite(imm, v, prec);
-  const vars = variationsAppart(imm, idx);
+  const vars = variationsAppartSeq(seq, posSeq);
   const alertesAppart = vars.filter((x) => x.alerte);
 
   // photos
@@ -950,7 +1053,7 @@ function App() {
   const [onglet, setOnglet] = useState("fiche");
   const [chargement, setChargement] = useState(true);
 
-  useEffect(() => { dbGetAll("immeubles").then((arr) => { setImmeubles(arr.sort((a, b) => (b.creeLe || "").localeCompare(a.creeLe || ""))); setChargement(false); }); }, []);
+  useEffect(() => { dbGetAll("immeubles").then((arr) => { setImmeubles(arr.map(migrerImmeuble).sort((a, b) => (b.creeLe || "").localeCompare(a.creeLe || ""))); setChargement(false); }); }, []);
 
   const sel = immeubles.find((i) => i.id === selId);
 
@@ -1021,11 +1124,9 @@ function App() {
 }
 
 
-const rootEl = document.getElementById("root");
-ReactDOM.createRoot(rootEl).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 </script>
 <script>
-// Service worker pour installation PWA + cache hors-ligne (données restent dans IndexedDB)
 if ("serviceWorker" in navigator) {
   const swCode = `
     const CACHE = "eauvea-v1";
@@ -1046,8 +1147,7 @@ if ("serviceWorker" in navigator) {
     });
   `;
   const blob = new Blob([swCode], { type: "application/javascript" });
-  const swUrl = URL.createObjectURL(blob);
-  navigator.serviceWorker.register(swUrl).catch(() => {});
+  navigator.serviceWorker.register(URL.createObjectURL(blob)).catch(() => {});
 }
 </script>
 </body>
